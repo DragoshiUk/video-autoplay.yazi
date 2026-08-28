@@ -297,6 +297,18 @@ designed to share a screen with another TUI.
   still real process spawns). A 0.15s debounce means scrolling quickly
   through many videos mostly skips this work for files you scroll past,
   but it's not free.
+- Some real-world `.avi` files have shown either a "No more keyframes
+  available" message or playback stuck on the first frame, likely a
+  malformed/incomplete keyframe index (more common with looser AVI muxers
+  than newer formats) causing `mpv`'s loop-back seek to fail. Both a
+  simple remux and a properly Xvid-encoded synthetic test file played and
+  looped cleanly here, so the exact trigger couldn't be reproduced or
+  fully verified against. `--demuxer-lavf-o=fflags=+genpts` is included as
+  a well-known mitigation for this class of problem (regenerates
+  timestamps rather than trusting the container's own; a no-op for
+  well-formed files) but isn't confirmed to resolve every case. If you hit
+  this, an `.avi` file's specifics (how it was created/encoded) would help
+  narrow it down further.
 
 ## License
 

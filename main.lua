@@ -270,10 +270,22 @@ end
 -- matches what mpv is about to show, at the cost of one fast ffmpeg call
 -- (~70ms) per hover -- acceptable given the 0.15s debounce already ahead
 -- of this in peek().
+-- ya.preview_widget (yazi-plugin/src/utils/preview.rs) only accepts nil, a
+-- renderable (or table of them), or a proper mlua Error userdata -- never
+-- a plain Lua string. ya.image_show's own failure already returns a
+-- proper Error, safe to hand straight to preview_widget, but a plain
+-- string here (e.g. "extraction failed") would make it throw "preview
+-- widget must be a renderable element or a table of them" and take the
+-- whole peek() down with it -- hit live on a real .mov file that ffmpeg
+-- couldn't extract a frame from. So extraction failure logs its own
+-- detail via ya.err and returns a plain nil second value, not a string,
+-- keeping whatever comes out of this function always safe to hand
+-- directly to ya.preview_widget.
 local function prime(job)
 	local tmp = extract_thumbnail(job)
 	if not tmp then
-		return nil, "could not extract a thumbnail frame via ffmpeg"
+		ya.err("video-autoplay", "could not extract a thumbnail frame via ffmpeg", tostring(job.file.url))
+		return nil, nil
 	end
 
 	local area, err = ya.image_show(Url(tmp), job.area)
@@ -332,7 +344,12 @@ function M:peek(job)
 
 	local area, err = prime(job)
 	if not area then
-		ya.err("video-autoplay", "priming failed", err)
+		-- err is nil when extraction itself failed (already logged inside
+		-- prime()) vs. a proper Error when ya.image_show failed -- only
+		-- the latter needs logging here.
+		if err then
+			ya.err("video-autoplay", "priming failed", err)
+		end
 		return ya.preview_widget(job, err)
 	end
 
@@ -361,6 +378,19 @@ function M:peek(job)
 		"--osc=no",
 		"--osd-level=0",
 		"--really-quiet", -- silences status line + startup/info text alike
+		-- Speculative fix for an AVI-specific symptom ("No more keyframes
+		-- available", or playback stuck on the first frame) reported live
+		-- on real files that weren't available to reproduce against here
+		-- -- synthetic AVI test files (both a plain remux and a proper
+		-- Xvid encode) played and looped cleanly without it, so this
+		-- couldn't be directly verified to fix that specific case. Forces
+		-- ffmpeg/mpv to regenerate presentation timestamps rather than
+		-- trust the container's own, which is a well-known mitigation for
+		-- exactly this class of keyframe-index/seek problem on malformed
+		-- or looser-muxed containers (more common in AVI than newer
+		-- formats) -- and a no-op for files with valid timestamps already,
+		-- so safe to apply unconditionally rather than only for .avi.
+		"--demuxer-lavf-o=fflags=+genpts",
 		"--vo=kitty",
 		"--vo-kitty-alt-screen=no",
 		-- Don't let mpv clear the terminal on its own -- it clears far
