@@ -1,8 +1,13 @@
 # video-autoplay.yazi
 
-A [yazi](https://yazi-rs.github.io/) plugin that auto-plays mp4/webm previews
-— muted, looped, no controls — in the preview pane, using
-[mpv](https://mpv.io/)'s kitty terminal-graphics output driver.
+A [yazi](https://yazi-rs.github.io/) plugin that auto-plays mp4/webm/mov/
+avi/mkv previews — muted, looped, no controls — in the preview pane, using
+[mpv](https://mpv.io/)'s kitty terminal-graphics output driver. Nothing in
+this plugin is actually format-specific beyond a short extension list (see
+`VIDEO_EXTS` in `main.lua`) — `ffmpeg` (priming) and `mpv` (playback) both
+handle any container either supports, so extending this list to any other
+format `mpv` plays should be a two-line change: `VIDEO_EXTS` in `main.lua`,
+plus a matching mime rule in `yazi.toml`.
 
 This is the companion to
 [gif-autoplay.yazi](https://github.com/DragoshiUk/gif-autoplay.yazi), same
@@ -18,10 +23,10 @@ are the actual content here.
 
 ## What it does
 
-Hover an `.mp4` or `.webm` in yazi and it plays automatically — muted,
-looped, scaled to fill the preview pane — using `mpv --vo=kitty`. Move to
-another file and it stops and cleans up. That's the whole feature; there's
-no seek/pause/volume control, by design.
+Hover an `.mp4`, `.webm`, `.mov`, `.avi`, or `.mkv` in yazi and it plays
+automatically — muted, looped, scaled to fill the preview pane — using
+`mpv --vo=kitty`. Move to another file and it stops and cleans up. That's
+the whole feature; there's no seek/pause/volume control, by design.
 
 ## Requirements
 
@@ -60,6 +65,9 @@ rule for cleanup (see below for why the preloader is needed):
 prepend_previewers = [
     { mime = "video/mp4", run = "video-autoplay" },
     { mime = "video/webm", run = "video-autoplay" },
+    { mime = "video/quicktime", run = "video-autoplay" },  # .mov
+    { mime = "video/x-msvideo", run = "video-autoplay" },  # .avi
+    { mime = "video/x-matroska", run = "video-autoplay" }, # .mkv
     { mime = "video/*", run = "video" }, # yazi's built-in, for everything else
 ]
 

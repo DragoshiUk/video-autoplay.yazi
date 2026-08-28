@@ -1,6 +1,10 @@
 --- @since 26.1.22
--- Auto-plays mp4/webm previews (muted, looped) in the preview pane, using
--- mpv's kitty terminal-graphics output driver.
+-- Auto-plays mp4/webm/mov/avi/mkv previews (muted, looped) in the preview
+-- pane, using mpv's kitty terminal-graphics output driver. Nothing here is
+-- actually format-specific beyond the VIDEO_EXTS extension list below --
+-- ffmpeg (priming) and mpv (playback) both handle any container either
+-- supports, so this list is just "which mimes get routed to this plugin
+-- in yazi.toml", not a real functional limit.
 --
 -- Unlike gif-autoplay.yazi, this can't be a one-shot "transmit frames, let
 -- the terminal loop them" trick: video is too big to hand the terminal all
@@ -84,12 +88,12 @@
 --    scheduler source, but forcing a yield point is what fixed it live.
 --
 -- Priming: ya.image_show only decodes actual image formats -- it can't
--- read an mp4/webm container directly. gif-autoplay's fallback (show the
--- raw file if there's no cache) works there because GIF *is* a decodable
--- image format; for video that fallback fails outright, which silently
--- skips straight past spawning mpv. So when there's no cached thumbnail,
--- we grab one real frame via ffmpeg first (fast: it seeks to the first
--- frame, not a full decode) and prime with that instead.
+-- read a video container directly, of any kind. gif-autoplay's fallback
+-- (show the raw file if there's no cache) works there because GIF *is* a
+-- decodable image format; for video that fallback fails outright, which
+-- silently skips straight past spawning mpv. So when there's no cached
+-- thumbnail, we grab one real frame via ffmpeg first (fast: it seeks to
+-- the first frame, not a full decode) and prime with that instead.
 --
 -- Alignment: unlike icat (see gif-autoplay.yazi), mpv's kitty VO has no
 -- equivalent of --unicode-placeholder / stretch-to-fill placement, so it
@@ -176,9 +180,11 @@ local clear_url = ya.sync(function(state)
 	state.url = nil
 end)
 
+local VIDEO_EXTS = { mp4 = true, webm = true, mov = true, avi = true, mkv = true }
+
 local function is_video(url)
 	local ext = tostring(url):lower():match("%.([%w]+)$")
-	return ext == "mp4" or ext == "webm"
+	return ext ~= nil and VIDEO_EXTS[ext] == true
 end
 
 -- The watchdog's own delete-all escape (see WATCHDOG below) only runs
