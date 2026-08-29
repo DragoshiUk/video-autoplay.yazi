@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Parse an SWF header for frame rate + frame count. Prints 'fps frames'."""
+import sys, zlib, lzma
+
+def bits_needed_rect(data):
+    nbits = data[0] >> 3
+    total_bits = 5 + nbits * 4
+    return (total_bits + 7) // 8
+
+def main(path):
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    sig = raw[0:3]
+    version = raw[3]
+    body = raw[8:]  # skip signature(3) + version(1) + file_length(4)
+
+    if sig == b"CWS":
+        body = zlib.decompress(body)
+    elif sig == b"ZWS":
+        # SWF LZMA: 4 bytes compressed-length, then standard LZMA1 stream
+        # (5-byte props + 8-byte uncompressed size expected by lzma module)
+        compressed_len = int.from_bytes(body[0:4], "little")
+        lzma_data = body[4:4 + compressed_len]
+        filt = [{"id": lzma.FILTER_LZMA1}]
+        body = lzma.decompress(lzma_data, format=lzma.FORMAT_ALONE)
+    elif sig != b"FWS":
+        raise ValueError(f"Not an SWF file (signature={sig!r})")
+
+    rect_bytes = bits_needed_rect(body)
+    off = rect_bytes
+    frame_rate = int.from_bytes(body[off:off+2], "little") / 256.0
+    frame_count = int.from_bytes(body[off+2:off+4], "little")
+    print(f"{frame_rate:.4f} {frame_count}")
+
+if __name__ == "__main__":
+    main(sys.argv[1])

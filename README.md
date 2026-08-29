@@ -1,6 +1,6 @@
 # video-autoplay.yazi
 
-A [yazi](https://yazi-rs.github.io/) plugin that auto-plays mp4/webm
+A [yazi](https://yazi-rs.github.io/) plugin that auto-plays mp4/webm/swf
 previews — muted, looped, no controls — in the preview pane, using
 [mpv](https://mpv.io/)'s kitty terminal-graphics output driver.
 
@@ -29,18 +29,43 @@ looped, scaled to fill the preview pane — using `mpv --vo=kitty`. Move to
 another file and it stops and cleans up. That's the whole feature;
 there's no seek/pause/volume control, by design.
 
+`.swf` (Flash) files play the same way — transcoded to a real video first
+(see [swf support](#swf-flash-support) below) — except for swf content
+that isn't actually animating, which shows as a single still frame instead
+of a looping video (also covered below).
+
 ## Requirements
 
 - yazi, with a kitty-graphics-protocol-capable terminal — developed and
   tested against kitty itself
 - [mpv](https://mpv.io/) built with the `kitty` VO (`mpv --vo=help | grep
   kitty` to check)
-- `ffmpeg` (used to grab a priming thumbnail — see below)
+- `ffmpeg` (used to grab a priming thumbnail, and to assemble swf frames
+  into a video — see below)
 - `sh` on `PATH` (any POSIX shell; the watchdog script doesn't require bash
   specifically, though it's what this was developed and tested against)
 
 Falls back to yazi's normal static preview on any other terminal/adaptor, or
 if `mpv`/`ffmpeg` aren't found.
+
+Previewing `.swf` files additionally needs:
+
+- [Ruffle's `exporter` tool](https://github.com/ruffle-rs/ruffle/tree/main/exporter),
+  which rasterizes swf frames. Not published as a binary release; build it
+  yourself:
+  ```sh
+  git clone --depth 1 https://github.com/ruffle-rs/ruffle.git
+  cd ruffle && cargo build --release --package=exporter
+  cp target/release/exporter ~/.local/bin/ruffle-exporter
+  ```
+  (needs a JDK on `PATH` to build — Ruffle's AS3 playerglobal build step
+  requires one)
+- [ImageMagick](https://imagemagick.org/) (`identify`), used to tell real
+  swf animation apart from non-animating content
+- `swf-header`, a small script bundled in this repo — copy it onto `PATH`:
+  ```sh
+  cp swf-header ~/.local/bin/
+  ```
 
 ## Installation
 
@@ -66,6 +91,7 @@ rule for cleanup (see below for why the preloader is needed):
 prepend_previewers = [
     { mime = "video/mp4", run = "video-autoplay" },
     { mime = "video/webm", run = "video-autoplay" },
+    { url = "*.swf", run = "video-autoplay" }, # omit if not previewing swf
     { mime = "video/*", run = "video" }, # yazi's built-in, for everything else
 ]
 
@@ -73,6 +99,10 @@ prepend_preloaders = [
     { url = "*", run = "video-autoplay" },
 ]
 ```
+
+`.swf` is matched by `url`, not `mime` — yazi's own mime sniffer doesn't
+report `application/x-shockwave-flash` for it the way the system `file`
+command does, so a `mime` rule silently never matches.
 
 That's it — no further options.
 
@@ -283,6 +313,75 @@ designed to share a screen with another TUI.
   here. Self-corrects on yazi's very next redraw; hasn't been observed to
   be more than a cosmetic, occasional flicker.
 
+### swf (Flash) support
+
+`mpv` (via `ffmpeg`/`libavformat`) has no real Flash renderer — its swf
+demuxer only reads embedded FLV-style streams, not the vector/timeline
+content that's actually in most Flash animations. So `.swf` is handled
+completely differently from mp4/webm: transcode once to a real mp4 (cached
+under yazi's own file cache, keyed by content+mtime like any other
+thumbnail) using [Ruffle](https://ruffle.rs/)'s `exporter` tool to
+rasterize every frame, then hand that mp4's path to the exact same
+`mpv`/watchdog machinery described above — nothing past that point needs
+to know the original file was ever a `.swf`. `--force-play` bypasses
+"click to play" gates some Flash content has, since this plugin treats swf
+as a non-interactive clip; there's no interactivity being lost by forcing
+it to play.
+
+Frame rate for the assembled mp4 comes from the swf's own header, read by
+the bundled `swf-header` script rather than `ffprobe` — tested live,
+`ffprobe` fails outright on swf, even a plain uncompressed one, not just
+compressed variants. `swf-header` parses the header directly instead:
+signature, optional zlib/lzma decompression, skip the stage-size `RECT`,
+read the 2-byte frame rate. Falls back to a guessed 24fps if that ever
+fails, rather than aborting the transcode over a cosmetic timing mismatch.
+
+#### Telling real animation from content that only looks like it
+
+A lot of real-world swf files are Flash *applications* — button states,
+hidden layers driven by click handlers — rather than a single continuous
+timeline, even though `exporter`'s `--frames all` will happily step
+through them frame by frame regardless. Playing that result back as a
+looping video means looping through however many distinct visual states
+the timeline happens to have — sometimes as few as two, alternating
+between real content and a blank/placeholder frame every loop. Confirmed
+live on real files, this ranges from an obvious hard flash between content
+and blank, to a subtler version where the blank frame is a small minority
+of the total, still producing a brief flash on every loop cycle.
+
+First approach tried: use each exported frame's PNG file size as a proxy
+for "how much is actually drawn" (a near-solid frame compresses far
+smaller than a detailed one), and cluster frames whose sizes jump by more
+than 30%. Wrong signal — confirmed live on two real files with genuinely
+continuous motion throughout (up to 184 frames), where the *pixels* keep
+changing but the overall visual complexity, and so the compressed size,
+stays within a narrow band the whole time. The clustering saw ~1 cluster
+either way and couldn't tell continuous motion from a stuck frame apart.
+
+What actually works: comparing frames by pixel content instead of
+compressed size, via ImageMagick's `identify -format "%#"` (a hash of the
+decoded pixels, unaffected by PNG compression variance) and counting how
+many *distinct* states exist across all of a file's frames. Real animation
+has a high distinct-to-total ratio, since the content keeps changing frame
+to frame (confirmed live: 86 distinct out of 184 frames, 32 out of 44);
+non-animating content collapses to 1-2 distinct states regardless of frame
+count, confirmed on a 1220-frame file that's genuinely just one still
+frame repeated, and on files that alternate between exactly one real frame
+and one blank one. 1-2 distinct states, for 3 or more frames, means the
+timeline isn't really animating — fall back to a single still frame (the
+one with the largest file size, as a proxy for most detailed) instead of
+assembling a video. Two or fewer *header* frames skip straight to this
+same still-frame fallback without needing to count anything — a real
+animation is never authored as just 1-2 main-timeline frames, and the
+distinct-state count can't meaningfully distinguish anything at n≤2 anyway.
+
+Showing that still frame bypasses `mpv` entirely — it's rendered directly
+with `ya.image_show`, the same as any static image. This still has to run
+through the same marker-file/graphics cleanup a genuine "left video" hover
+would: nothing else would tell a *previous* file's still-running `mpv` to
+stop, since (as far as the rest of this plugin's lifecycle handling is
+concerned) hovering a swf always counts as "video."
+
 ## Limitations
 
 - **kitty-only.** Other terminals/adaptors fall back to yazi's default
@@ -295,6 +394,18 @@ designed to share a screen with another TUI.
   still real process spawns). A 0.15s debounce means scrolling quickly
   through many videos mostly skips this work for files you scroll past,
   but it's not free.
+- **swf frame count comes from the header**, which is a documented Ruffle
+  limitation, not something worked around here: content whose actual
+  frame count is driven by nested clips beyond the main timeline's header
+  count can end up truncated.
+- **swf transcoding is synchronous and per-file** — the first hover on any
+  given swf blocks on a real Ruffle render + `ffmpeg` encode (typically a
+  second or a few); every hover after that is instant, served from cache.
+- If the underlying storage stalls badly enough to put `mpv` into an
+  uninterruptible kernel wait (e.g. a flaky "hard"-mounted NFS share), no
+  amount of signal-sending from this plugin can kill it until the stall
+  itself resolves — `SIGKILL` can't preempt that. Rare, and not something
+  fixable from a plugin.
 
 ## License
 

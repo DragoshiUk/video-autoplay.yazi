@@ -1,4 +1,26 @@
 --- @since 26.1.22
+--
+-- INCIDENT (2026-08-29): swf-as-video support (transcode via Ruffle, then
+-- play through this file's mpv machinery) caused mpv to get stuck looping
+-- indefinitely with multiple instances overlapping, plus slow directory
+-- traversal, badly enough to be an emergency-disable (rapid on-screen
+-- flashing). Re-enabled after finding two compounding causes, both fixed:
+--   1. preload() was transcoding every swf merely scrolled past, not just
+--      the one actually previewed -- a backlog of multi-second, blocking
+--      Ruffle+ffmpeg calls. Fixed: transcode_swf() now only ever runs
+--      lazily from peek(), matching how real video priming already works
+--      elsewhere in this file (preload() never did the expensive work for
+--      that either, only cleanup).
+--   2. peek()'s "busy" (concurrency-limited) path used to self-retry via
+--      ya.emit("peek", {..., only_if=..., force=true}) -- suspected,
+--      not fully confirmed, that force=true bypassed the only_if guard,
+--      letting a backlogged retry spawn mpv for a file long since
+--      scrolled past. Fixed by removing the retry: "busy" now just
+--      renders blank and waits for the next natural hover.
+-- Together these should mean transcode_swf() is essentially never
+-- contended in normal use (only one peek() is "current" at a time), so
+-- MAX_CONCURRENT_TRANSCODES should rarely even matter now.
+--
 -- Auto-plays mp4/webm previews (muted, looped) in the preview pane, using
 -- mpv's kitty terminal-graphics output driver. Nothing here is actually
 -- format-specific beyond the VIDEO_EXTS extension list below -- ffmpeg
@@ -159,6 +181,18 @@
 
 local M = {}
 
+-- REVERTED (2026-08-29): tried scoping this per-yazi-instance (see git
+-- history) to fix two concurrent yazi windows fighting over one marker
+-- file. Reverted, unverified, after it appeared to cause every mp4/webm
+-- hover to spawn a new, never-superseded watchdog instead -- suspected
+-- cause: yazi may re-execute this module fresh per plugin invocation
+-- rather than loading it once per process, which would silently break
+-- the "MARKER is a stable constant for this process's lifetime"
+-- assumption the instance-scoping attempt depended on. Not confirmed;
+-- reverted fast because it was causing multiple videos to play at once,
+-- not root-caused. Back to the original single-marker-per-user scheme,
+-- which has the known (much milder) two-yazi-instances-collide issue but
+-- is the last confirmed-working state.
 local MARKER = "/tmp/yazi-video-autoplay-" .. (os.getenv("USER") or "shared") .. ".marker"
 
 -- Best-effort only, purely to skip redundant respawns of the file already
@@ -181,10 +215,23 @@ local clear_url = ya.sync(function(state)
 end)
 
 local VIDEO_EXTS = { mp4 = true, webm = true }
+local SWF_EXTS = { swf = true }
 
+local function ext_of(url)
+	return tostring(url):lower():match("%.([%w]+)$")
+end
+
+-- "Is this something this plugin will animate" -- true for real videos AND
+-- swf (transcoded to an mp4 first, see SWF TRANSCODING below), since both
+-- need the same hover-cleanup/marker-file lifecycle handling.
 local function is_video(url)
-	local ext = tostring(url):lower():match("%.([%w]+)$")
-	return ext ~= nil and VIDEO_EXTS[ext] == true
+	local ext = ext_of(url)
+	return ext ~= nil and (VIDEO_EXTS[ext] == true or SWF_EXTS[ext] == true)
+end
+
+local function is_swf(url)
+	local ext = ext_of(url)
+	return ext ~= nil and SWF_EXTS[ext] == true
 end
 
 -- The watchdog's own delete-all escape (see WATCHDOG below) only runs
@@ -244,21 +291,231 @@ if not ok then
 	ya.err("video-autoplay", "ps.sub(hover) registration failed", sub_err)
 end
 
+-- ─────────────────────────────────────────────────────────────
+--  SWF TRANSCODING
+--  mpv (via ffmpeg/libavformat) has no real Flash renderer -- its swf
+--  demuxer only reads embedded FLV-style streams, not the vector/timeline
+--  content that's actually in most Flash animations. So .swf is handled
+--  completely differently from mp4/webm above: transcode once to a real
+--  mp4 (cached under yazi's own file cache, keyed by content+mtime like
+--  any other thumbnail) using Ruffle's `exporter` tool to rasterize every
+--  frame, then hand that mp4's path to the exact same mpv/watchdog
+--  machinery used for real videos below -- nothing past this point needs
+--  to know the original file was ever a .swf.
+--
+--  --force-play bypasses "click to play" gates some Flash content has;
+--  fine here since these are treated as non-interactive clips, so there's
+--  no interactivity being lost.
+--
+--  Frame rate: ffmpeg/ffprobe can't reliably read a swf's header (tested
+--  live: fails outright even on a plain uncompressed FWS-signature file,
+--  not just compressed ones). `swf-header` (a small standalone script
+--  alongside this plugin, on PATH via ~/.local/bin) parses it directly
+--  instead -- signature, optional zlib/lzma decompression, skip the
+--  stage-size RECT, read the 2-byte frame rate. Falls back to a guessed
+--  24fps if that ever fails, rather than aborting the transcode over a
+--  cosmetic timing mismatch.
+--
+--  Frame count comes from the swf header too, via the exporter's own
+--  `--frames all`. Ruffle's own documented limitation, not something
+--  worked around here: content whose actual frame count is driven by
+--  nested clips beyond the main timeline's header count can end up
+--  truncated. Acceptable for the non-interactive single-timeline clips
+--  this is built for.
+--
+--  Throttled independently from the mpv/ffmpeg priming below -- this
+--  spawns a GPU-rendering process per file, so scrolling fast through a
+--  folder full of swf files shouldn't fire more than a couple of these
+--  concurrently.
+-- ─────────────────────────────────────────────────────────────
+local active_transcodes = 0
+local MAX_CONCURRENT_TRANSCODES = 2
+
+local function swf_frame_rate(path)
+	local out = Command("swf-header"):arg(path):stdout(Command.PIPED):stderr(Command.NULL):output()
+	local fps = out and out.stdout and tonumber((out.stdout):match("^(%S+)"))
+	return fps or 24
+end
+
+-- Some "interactive" swf content (button states, hidden layers driven by
+-- click handlers rather than a linear timeline) doesn't have anything
+-- resembling continuous motion on its main timeline -- --force-play just
+-- steps the timeline forward regardless of what each frame actually
+-- represents, so playing it back as video means looping through however
+-- many distinct visual states it happens to have, however few.
+--
+-- First version of this (see git history) used PNG file size as a proxy
+-- for "how much is actually drawn," clustering frames whose sizes jumped
+-- by more than 30%. Wrong signal, confirmed live: real animation can have
+-- roughly-constant visual complexity frame to frame (a moving character
+-- against a similar background, say) despite the *pixels* constantly
+-- changing -- two confirmed real regressions (a 184-frame and an
+-- 18-frame clip) had file sizes that only ever drifted within a narrow
+-- band, so the size-jump clustering saw ~1 cluster and wrongly called
+-- them static, even though they're genuinely continuous motion throughout.
+--
+-- Fixed by measuring the actual thing that matters -- pixel content, not
+-- compressed size -- via ImageMagick's `identify -format "%#"`, a hash of
+-- the decoded pixels themselves (unaffected by PNG compression variance).
+-- Counting *distinct* hashes across all frames directly answers "how many
+-- unique visual states does this timeline actually have": confirmed live,
+-- real animation has a high distinct-to-total ratio (e.g. 86/184, 32/44)
+-- since content keeps changing, while degenerate/interactive timelines
+-- collapse to 1-2 distinct states regardless of frame count (confirmed on
+-- a 1220-frame file that's genuinely just one still, and the original
+-- content/blank/blank/.../content flashing case). 1-2 distinct states
+-- means "this timeline isn't animating" -- fall back to a single static
+-- frame (the largest file size among them, as a proxy for most detailed)
+-- instead of assembling a video.
+--
+-- Two or fewer header frames is treated as static unconditionally, same
+-- conclusion by construction rather than by counting: distinct states
+-- can only ever be 1 or 2 regardless of content, so the counting logic
+-- can't tell anything apart there anyway, and a real intentional
+-- animation is never authored as just 1-2 main-timeline frames.
+local function classify_frames(frame_paths)
+	local n = #frame_paths
+	if n <= 2 then
+		return "static"
+	end
+
+	local cmd = Command("magick"):arg("identify"):arg("-format"):arg("%#\n")
+	for _, p in ipairs(frame_paths) do
+		cmd = cmd:arg(p)
+	end
+	local out = cmd:stdout(Command.PIPED):stderr(Command.NULL):output()
+	if not out or not out.stdout then
+		return "video" -- couldn't hash frames; default to the safer (never-blank) behavior
+	end
+
+	local seen, distinct = {}, 0
+	for hash in out.stdout:gmatch("%S+") do
+		if not seen[hash] then
+			seen[hash] = true
+			distinct = distinct + 1
+		end
+	end
+	return distinct <= 2 and "static" or "video"
+end
+
+-- Returns (path, kind) on success, where kind is "video" (play play_path
+-- as a looping mpv video, as normal) or "image" (a single static frame --
+-- see classify_frames above -- render with ya.image_show instead, no mpv
+-- involved at all). Returns nil (transcode failed, or skipped because
+-- MAX_CONCURRENT_TRANSCODES is already busy) if not ready -- callers
+-- should treat that as "not ready yet" and let a later preload()/peek()
+-- retry, same as image-grid.yazi's cache-miss pattern.
+--
+-- Which kind a given cache entry is has to survive across cache hits too
+-- (peek() re-checks every hover, potentially long after the transcode
+-- that decided it), so it's recorded as an empty sidecar marker file
+-- next to the cache entry itself rather than recomputed.
+local function transcode_swf(job)
+	local cache = ya.file_cache(job)
+	if not cache then
+		return nil
+	end
+	local marker = tostring(cache) .. ".static"
+	if fs.cha(cache) then
+		return tostring(cache), (fs.cha(Url(marker)) and "image" or "video")
+	end
+	if active_transcodes >= MAX_CONCURRENT_TRANSCODES then
+		return nil, "busy"
+	end
+	active_transcodes = active_transcodes + 1
+
+	local path = tostring(job.file.path)
+	local frame_dir = os.tmpname()
+	os.remove(frame_dir)
+	Command("mkdir"):arg({ "-p", frame_dir }):status()
+
+	local export_status = Command("ruffle-exporter")
+		:arg({ path, frame_dir, "--frames", "all", "--force-play", "--silent" })
+		:stdout(Command.NULL)
+		:stderr(Command.NULL)
+		:status()
+
+	if not export_status or not export_status.success then
+		active_transcodes = active_transcodes - 1
+		Command("rm"):arg({ "-rf", frame_dir }):status()
+		ya.err("video-autoplay", "ruffle-exporter failed", path)
+		return nil
+	end
+
+	local frames = fs.read_dir(Url(frame_dir), {})
+	if not frames or #frames == 0 then
+		active_transcodes = active_transcodes - 1
+		Command("rm"):arg({ "-rf", frame_dir }):status()
+		ya.err("video-autoplay", "ruffle-exporter produced no frames", path)
+		return nil
+	end
+	table.sort(frames, function(a, b) return a.url.name < b.url.name end)
+
+	local frame_paths = {}
+	for i, f in ipairs(frames) do
+		frame_paths[i] = tostring(f.url)
+	end
+	local kind = classify_frames(frame_paths)
+
+	local ok
+	if kind == "static" then
+		local best, best_size = frames[1], -1
+		for _, f in ipairs(frames) do
+			if f.cha.len > best_size then
+				best, best_size = f, f.cha.len
+			end
+		end
+		ok = Command("cp"):arg({ tostring(best.url), tostring(cache) }):status()
+		if ok and ok.success then
+			Command("touch"):arg({ marker }):status()
+		end
+	else
+		ok = Command("ffmpeg")
+			:arg({
+				"-y",
+				"-loglevel", "error",
+				"-framerate", tostring(swf_frame_rate(path)),
+				"-pattern_type", "glob",
+				"-i", frame_dir .. "/*.png",
+				"-pix_fmt", "yuv420p",
+				"-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+				"-f", "mp4",
+				"-movflags", "+faststart",
+				tostring(cache),
+			})
+			:stdout(Command.NULL)
+			:stderr(Command.NULL)
+			:status()
+	end
+
+	active_transcodes = active_transcodes - 1
+	Command("rm"):arg({ "-rf", frame_dir }):status()
+
+	if not ok or not ok.success then
+		ya.err("video-autoplay", (kind == "static" and "static frame copy failed" or "ffmpeg frame assembly failed"), path)
+		return nil
+	end
+	return tostring(cache), kind
+end
+
 -- Extracts a single frame near the start of the video to a temp file via
 -- ffmpeg. Forces mjpeg output explicitly (-f) rather than relying on a
 -- .jpg extension, since os.tmpname() doesn't give us one.
 --
--- Uses job.file.path, NOT job.file.url. Hovering a file inside yazi's
--- search results gives a url like "search://mp4$:4:4//real/path/x.mp4" --
--- a yazi-internal pseudo-URL, not something ffmpeg (or mpv, see peek()
--- below) has any way to open. job.file.path is the resolved real path
--- either way (confirmed identical to tostring(job.file.url) for a
--- plain, non-search hover, so this doesn't change behavior outside
--- search results) -- yazi-shared/src/url/lua.rs's "path" field is
--- exactly this resolution (me.loc()), which is what ya.image_show does
--- internally too (as_local()), just not something we were doing
--- ourselves for the raw ffmpeg/mpv command lines.
-local function extract_thumbnail(job)
+-- Takes an explicit `path` rather than reading job.file.path itself, so
+-- the swf case above can hand in its transcoded mp4's path instead --
+-- see the play_path computation in peek() below. For real video, callers
+-- pass tostring(job.file.path), NOT job.file.url: hovering a file inside
+-- yazi's search results gives a url like "search://mp4$:4:4//real/path/x.mp4"
+-- -- a yazi-internal pseudo-URL, not something ffmpeg (or mpv) has any way
+-- to open. job.file.path is the resolved real path either way (confirmed
+-- identical to tostring(job.file.url) for a plain, non-search hover, so
+-- this doesn't change behavior outside search results) --
+-- yazi-shared/src/url/lua.rs's "path" field is exactly this resolution
+-- (me.loc()), which is what ya.image_show does internally too
+-- (as_local()), just not something we were doing ourselves for the raw
+-- ffmpeg/mpv command lines.
+local function extract_thumbnail(path)
 	local tmp = os.tmpname()
 	local status = Command("ffmpeg")
 		:arg({
@@ -268,7 +525,7 @@ local function extract_thumbnail(job)
 			"-ss",
 			"0",
 			"-i",
-			tostring(job.file.path),
+			path,
 			"-frames:v",
 			"1",
 			"-f",
@@ -310,8 +567,8 @@ end
 -- detail via ya.err and returns a plain nil second value, not a string,
 -- keeping whatever comes out of this function always safe to hand
 -- directly to ya.preview_widget.
-local function prime(job)
-	local tmp = extract_thumbnail(job)
+local function prime(job, path)
+	local tmp = extract_thumbnail(path)
 	if not tmp then
 		ya.err("video-autoplay", "could not extract a thumbnail frame via ffmpeg", tostring(job.file.url))
 		return nil, nil
@@ -391,12 +648,52 @@ function M:peek(job)
 		return
 	end
 
+	-- For swf, everything past this point (priming, mpv) operates on the
+	-- transcoded mp4's path instead of the original file -- see SWF
+	-- TRANSCODING above. A nil here means not ready yet (still
+	-- transcoding, or MAX_CONCURRENT_TRANSCODES is busy): bail quietly,
+	-- preload() or a later hover will retry.
+	local play_path = url
+	if is_swf(job.file.url) then
+		local kind
+		play_path, kind = transcode_swf(job)
+		if not play_path then
+			-- No self-retry here on purpose (a previous version emitted a
+			-- follow-up "peek" on "busy" and that's suspected -- not fully
+			-- confirmed -- to have combined with preload()'s since-removed
+			-- eager transcoding to spawn mpv long after the user had
+			-- scrolled past a file, matching a real "videos never stop,
+			-- multiple playing at once" incident). Just render blank; the
+			-- next natural hover (this file or otherwise) tries again.
+			return ya.preview_widget(job, nil)
+		end
+
+		if kind == "image" then
+			-- classify_frames (see SWF TRANSCODING above) decided this
+			-- file's timeline is a mostly-static interactive one, not a
+			-- real animation -- render its single representative frame
+			-- directly, no mpv involved. Still has to run the same
+			-- cleanup a genuine "left video" hover transition would (the
+			-- ps.sub("hover") handler above never fires it here: is_video()
+			-- rightly says .swf counts as video for lifecycle purposes,
+			-- but this particular hover isn't spawning mpv, so any
+			-- previous file's mpv/watchdog would otherwise be left running
+			-- underneath a static frame that never tells it to stop).
+			os.remove(MARKER)
+			clear_url()
+			self.child = nil
+			clear_graphics()
+			local _, show_err = ya.image_show(Url(play_path), job.area)
+			return ya.preview_widget(job, show_err)
+		end
+	end
+
 	if not job.area or job.area.w == 0 or job.area.h == 0 then
-		local _, err = prime(job)
+		local _, err = prime(job, play_path)
 		return ya.preview_widget(job, err)
 	end
 
-	local area, err = prime(job)
+	local area, err = prime(job, play_path)
 	if not area then
 		-- err is nil when extraction itself failed (already logged inside
 		-- prime()) vs. a proper Error when ya.image_show failed -- only
@@ -444,7 +741,7 @@ function M:peek(job)
 		("--vo-kitty-left=%d"):format(area.x + 1), -- 1-indexed per mpv's docs
 		("--vo-kitty-top=%d"):format(area.y + 1),
 		("--video-aspect-override=%d:%d"):format(px_w, px_h), -- see alignment note up top
-		tostring(job.file.path), -- not job.file.url -- see the note on extract_thumbnail
+		play_path, -- transcoded mp4 for swf, else job.file.path -- not job.file.url, see the note on extract_thumbnail
 	}
 
 	local child, spawn_err = Command("sh")
@@ -476,6 +773,17 @@ function M:seek() end
 -- Backup cleanup path only -- ps.sub("hover") above is the reliable one.
 -- Kept because it's cheap and covers the (currently theoretical) case of
 -- that subscription itself failing to register.
+--
+-- Deliberately does NOT kick off swf transcoding here (an earlier version
+-- did -- see incident note at top of file). yazi's wildcard preloader
+-- rule fires this for every file merely scrolled past, not just the one
+-- actually previewed, which made transcoding-on-preload both slow
+-- (backlog of multi-second Ruffle+ffmpeg calls for files never even
+-- looked at) and suspected to be part of what let mpv end up spawned for
+-- files long since scrolled past. transcode_swf() runs lazily from
+-- peek() instead, same as real video priming already does elsewhere in
+-- this file -- there's no precedent here for preload() doing the actual
+-- expensive work for playback, only for cleanup.
 function M:preload(job)
 	if not is_video(job.file.url) then
 		os.remove(MARKER)
