@@ -4,18 +4,11 @@ A [yazi](https://yazi-rs.github.io/) plugin that auto-plays mp4/webm
 previews — muted, looped, no controls — in the preview pane, using
 [mpv](https://mpv.io/)'s kitty terminal-graphics output driver.
 
-**Before using this, read [Known Serious Issue](#known-serious-issue)
-below.** It's a real, currently-unresolved bug, not a footnote.
-
 Nothing in this plugin is actually format-specific beyond a short
 extension list (see `VIDEO_EXTS` in `main.lua`) — `ffmpeg` (priming) and
 `mpv` (playback) both handle any container either supports, so extending
-this list to any other format `mpv` plays would normally be a two-line
-change: `VIDEO_EXTS` in `main.lua`, plus a matching mime rule in
-`yazi.toml`. mov/avi/mkv support was tried and deliberately pulled back
-to just mp4/webm after the issue below kept surfacing on mov files — see
-that section for why re-adding them isn't just a two-line change right
-now.
+this list to any other format `mpv` plays is a two-line change:
+`VIDEO_EXTS` in `main.lua`, plus a matching mime rule in `yazi.toml`.
 
 This is the companion to
 [gif-autoplay.yazi](https://github.com/DragoshiUk/gif-autoplay.yazi), same
@@ -82,56 +75,6 @@ prepend_preloaders = [
 ```
 
 That's it — no further options.
-
-## Known Serious Issue
-
-**While a video is playing, yazi's own keyboard input can get corrupted.**
-Observed live as: hit yazi's search hotkey, the search box opens and
-immediately closes again, repeatedly — unusable for as long as a video is
-on screen. This is not the cosmetic torn-escape-sequence flicker mentioned
-further down; it's yazi's actual input handling breaking.
-
-This is confirmed **not specific to this plugin, or to yazi at all**: it
-reproduces with a plain
-
-```sh
-mpv --vo=kitty --loop-file=inf some-video.mp4 &
-```
-
-backgrounded in an ordinary shell — no yazi, no plugin code involved.
-Typing normally in that same shell while it plays reproduces the same
-corruption. It's a genuine `mpv` + kitty terminal interaction bug that
-shows up whenever `mpv --vo=kitty` runs backgrounded, sharing a pty with
-another foreground reader — exactly the situation this plugin necessarily
-creates.
-
-Three separate, individually well-reasoned fixes were tried and **all
-failed** to resolve it:
-
-- `--input-cursor=no` — disables `mpv`'s mouse-tracking terminal mode,
-  which a related upstream issue,
-  [mpv-player/mpv#16299](https://github.com/mpv-player/mpv/issues/16299)
-  ("Exiting via ^c with --vo=kitty outputs random symbols in stdin"),
-  pointed at.
-- `--vo-kitty-use-shm=yes` — shared-memory frame transfer, to avoid a
-  non-atomic-write risk `mpv`'s own source explicitly calls out (writes
-  over `PIPE_BUF`, ~4KB on Linux, aren't guaranteed atomic — every
-  base64-encoded video frame blows past that by a huge margin).
-- `--input-terminal=no` (already included regardless, since it's correct
-  practice) — doesn't touch it either.
-
-The root cause is still unidentified. A real next step would be
-`strace`-level tracing of exactly which process consumes the corrupted
-bytes, which hasn't been done. mov/avi/mkv format support was pulled back
-to just mp4/webm after this kept surfacing on mov files specifically —
-**that's a reduction in exposure, not a fix**, since nothing found so far
-ties the mechanism to any particular container format. It's plausible
-(not confirmed) that it's less likely to trigger with mp4/webm in
-practice, but treat that as a hope, not a guarantee.
-
-If you hit this, or have insight into the actual mechanism, please open
-an issue — this is the one thing standing in the way of calling this
-plugin reliable.
 
 ## How it works, and why
 
@@ -342,17 +285,12 @@ designed to share a screen with another TUI.
 
 ## Limitations
 
-- **See [Known Serious Issue](#known-serious-issue) above first** — a real
-  reliability problem, not a minor caveat.
 - **kitty-only.** Other terminals/adaptors fall back to yazi's default
   static-first-frame behavior.
-- **mp4/webm only.** mov/avi/mkv were supported briefly and pulled back;
-  see Known Serious Issue for why.
 - No seek, pause, volume, or any playback controls. Always-on autoplay,
   muted, looped, for as long as the file is being previewed.
 - The occasional torn-escape-sequence flicker described further down is a
-  separate, known, currently unfixable-from-here *cosmetic* issue — not
-  to be confused with the serious one above.
+  known, currently unfixable-from-here *cosmetic* issue.
 - Every `peek()` re-spawns `mpv` + `ffmpeg` (a fast process each, but
   still real process spawns). A 0.15s debounce means scrolling quickly
   through many videos mostly skips this work for files you scroll past,

@@ -1,14 +1,10 @@
 --- @since 26.1.22
 -- Auto-plays mp4/webm previews (muted, looped) in the preview pane, using
--- mpv's kitty terminal-graphics output driver. mov/avi/mkv support was
--- tried and pulled back: mov and avi both surfaced a serious, unresolved
--- mpv+kitty terminal issue (see the KNOWN SERIOUS ISSUE note further
--- down) -- pulling them back is a scope reduction, not a fix for that
--- issue, since it isn't tied to any particular container format. Nothing
--- else here is actually format-specific beyond the VIDEO_EXTS extension
--- list below -- ffmpeg (priming) and mpv (playback) both handle any
--- container either supports, so re-adding a format is just adding its
--- extension there and a matching mime rule in yazi.toml, same as before.
+-- mpv's kitty terminal-graphics output driver. Nothing here is actually
+-- format-specific beyond the VIDEO_EXTS extension list below -- ffmpeg
+-- (priming) and mpv (playback) both handle any container either supports,
+-- so adding a format is just adding its extension there and a matching
+-- mime rule in yazi.toml.
 --
 -- Unlike gif-autoplay.yazi, this can't be a one-shot "transmit frames, let
 -- the terminal loop them" trick: video is too big to hand the terminal all
@@ -158,30 +154,6 @@
 --    fully fixable from a plugin: there's no lock to acquire. Self-corrects
 --    on yazi's next redraw; hasn't been observed to be more than cosmetic.
 --
--- KNOWN SERIOUS ISSUE, unresolved: while a video is playing, yazi's own
--- keyboard input can get corrupted -- observed live as the search hotkey
--- opening and immediately closing again, repeatedly, unusably. This is
--- NOT cosmetic like the tearing above, and NOT specific to this plugin --
--- reproduced with a plain `mpv --vo=kitty ... &` backgrounded in a plain
--- shell (no yazi, no plugin code at all involved), confirming it's a
--- genuine mpv+kitty terminal interaction bug when mpv is backgrounded
--- sharing a pty with another foreground reader. Three separate,
--- individually well-reasoned fixes were tried and all failed to resolve
--- it: --input-terminal=no (mpv's own documented flag for exactly this
--- class of problem), --input-cursor=no (disabling mpv's mouse-tracking
--- terminal mode, which a related upstream mpv issue -- "Exiting via ^c
--- with --vo=kitty outputs random symbols in stdin", mpv-player/mpv#16299
--- -- pointed at), and --vo-kitty-use-shm=yes (shared-memory frame
--- transfer, to avoid mpv's own documented non-atomic-write risk for
--- writes over PIPE_BUF, which every base64-encoded video frame is by a
--- huge margin). None of these fixed it. The root cause remains
--- unidentified; a definitive next step would be strace-level tracing of
--- which process actually consumes the corrupted bytes, which wasn't
--- completed. Format scope was pulled back from mp4/webm/mov/avi/mkv to
--- just mp4/webm after this was hit repeatedly with mov files -- that is a
--- reduction in exposure, not a fix, since nothing about the mechanism
--- found so far is tied to any particular container format.
---
 -- Only works when the frontend is kitty and mpv is built with the kitty
 -- VO. Falls back to a normal static preview otherwise.
 
@@ -277,7 +249,7 @@ end
 -- .jpg extension, since os.tmpname() doesn't give us one.
 --
 -- Uses job.file.path, NOT job.file.url. Hovering a file inside yazi's
--- search results gives a url like "search://mov$:4:4//real/path/x.mov" --
+-- search results gives a url like "search://mp4$:4:4//real/path/x.mp4" --
 -- a yazi-internal pseudo-URL, not something ffmpeg (or mpv, see peek()
 -- below) has any way to open. job.file.path is the resolved real path
 -- either way (confirmed identical to tostring(job.file.url) for a
@@ -333,7 +305,7 @@ end
 -- proper Error, safe to hand straight to preview_widget, but a plain
 -- string here (e.g. "extraction failed") would make it throw "preview
 -- widget must be a renderable element or a table of them" and take the
--- whole peek() down with it -- hit live on a real .mov file that ffmpeg
+-- whole peek() down with it -- hit live on a real file that ffmpeg
 -- couldn't extract a frame from. So extraction failure logs its own
 -- detail via ya.err and returns a plain nil second value, not a string,
 -- keeping whatever comes out of this function always safe to hand
