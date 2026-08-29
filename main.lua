@@ -1,10 +1,14 @@
 --- @since 26.1.22
--- Auto-plays mp4/webm/mov/avi/mkv previews (muted, looped) in the preview
--- pane, using mpv's kitty terminal-graphics output driver. Nothing here is
--- actually format-specific beyond the VIDEO_EXTS extension list below --
--- ffmpeg (priming) and mpv (playback) both handle any container either
--- supports, so this list is just "which mimes get routed to this plugin
--- in yazi.toml", not a real functional limit.
+-- Auto-plays mp4/webm previews (muted, looped) in the preview pane, using
+-- mpv's kitty terminal-graphics output driver. mov/avi/mkv support was
+-- tried and pulled back: mov and avi both surfaced a serious, unresolved
+-- mpv+kitty terminal issue (see the KNOWN SERIOUS ISSUE note further
+-- down) -- pulling them back is a scope reduction, not a fix for that
+-- issue, since it isn't tied to any particular container format. Nothing
+-- else here is actually format-specific beyond the VIDEO_EXTS extension
+-- list below -- ffmpeg (priming) and mpv (playback) both handle any
+-- container either supports, so re-adding a format is just adding its
+-- extension there and a matching mime rule in yazi.toml, same as before.
 --
 -- Unlike gif-autoplay.yazi, this can't be a one-shot "transmit frames, let
 -- the terminal loop them" trick: video is too big to hand the terminal all
@@ -154,6 +158,30 @@
 --    fully fixable from a plugin: there's no lock to acquire. Self-corrects
 --    on yazi's next redraw; hasn't been observed to be more than cosmetic.
 --
+-- KNOWN SERIOUS ISSUE, unresolved: while a video is playing, yazi's own
+-- keyboard input can get corrupted -- observed live as the search hotkey
+-- opening and immediately closing again, repeatedly, unusably. This is
+-- NOT cosmetic like the tearing above, and NOT specific to this plugin --
+-- reproduced with a plain `mpv --vo=kitty ... &` backgrounded in a plain
+-- shell (no yazi, no plugin code at all involved), confirming it's a
+-- genuine mpv+kitty terminal interaction bug when mpv is backgrounded
+-- sharing a pty with another foreground reader. Three separate,
+-- individually well-reasoned fixes were tried and all failed to resolve
+-- it: --input-terminal=no (mpv's own documented flag for exactly this
+-- class of problem), --input-cursor=no (disabling mpv's mouse-tracking
+-- terminal mode, which a related upstream mpv issue -- "Exiting via ^c
+-- with --vo=kitty outputs random symbols in stdin", mpv-player/mpv#16299
+-- -- pointed at), and --vo-kitty-use-shm=yes (shared-memory frame
+-- transfer, to avoid mpv's own documented non-atomic-write risk for
+-- writes over PIPE_BUF, which every base64-encoded video frame is by a
+-- huge margin). None of these fixed it. The root cause remains
+-- unidentified; a definitive next step would be strace-level tracing of
+-- which process actually consumes the corrupted bytes, which wasn't
+-- completed. Format scope was pulled back from mp4/webm/mov/avi/mkv to
+-- just mp4/webm after this was hit repeatedly with mov files -- that is a
+-- reduction in exposure, not a fix, since nothing about the mechanism
+-- found so far is tied to any particular container format.
+--
 -- Only works when the frontend is kitty and mpv is built with the kitty
 -- VO. Falls back to a normal static preview otherwise.
 
@@ -180,7 +208,7 @@ local clear_url = ya.sync(function(state)
 	state.url = nil
 end)
 
-local VIDEO_EXTS = { mp4 = true, webm = true, mov = true, avi = true, mkv = true }
+local VIDEO_EXTS = { mp4 = true, webm = true }
 
 local function is_video(url)
 	local ext = tostring(url):lower():match("%.([%w]+)$")
@@ -208,13 +236,30 @@ end
 -- file" bug this was hit by live. yazi's "hover" DDS event, by contrast,
 -- is fired by the navigation actor itself (yazi-actor/src/mgr/hover.rs)
 -- on every single hover change, uncached -- the reliable version of the
--- same signal. Wrapped in pcall since plugin-load-time ps.sub is a bit
--- unusual and we don't want a failure here to break previewing entirely;
--- if it fails, preload() below still provides partial coverage.
+-- same signal, EXCEPT the event body's own url field turned out to
+-- always be nil regardless of what's actually hovered: traced to
+-- yazi-dds/src/pubsub.rs's EmberHover::owned(), whose second parameter
+-- is literally named `_` and hardcodes url: None -- and Lua's ps.sub
+-- receives that "owned" published form, not the "borrowed" one that
+-- carries the real url. So this reads the actual hovered file back from
+-- cx instead of trusting the event payload, using the event purely as
+-- the "something changed, go check" signal. Hit live: relying on the
+-- (always-nil) body.url meant every single hover change was treated as
+-- "left video", including video-to-video and, worse, whatever hover
+-- churn yazi's own live search does while typing -- each one firing
+-- clear_graphics(), which was disrupting the search input itself.
+-- Wrapped in pcall since plugin-load-time ps.sub is a bit unusual and we
+-- don't want a failure here to break previewing entirely; if it fails,
+-- preload() below still provides partial coverage.
+local get_hovered_path = ya.sync(function(state)
+	local h = cx.active.current.hovered
+	return h and tostring(h.path) or nil
+end)
+
 local ok, sub_err = pcall(function()
-	ps.sub("hover", function(body)
-		local url = body.url and tostring(body.url) or nil
-		if url and is_video(url) then
+	ps.sub("hover", function()
+		local path = get_hovered_path()
+		if path and is_video(path) then
 			return
 		end
 		os.remove(MARKER)
@@ -230,6 +275,17 @@ end
 -- Extracts a single frame near the start of the video to a temp file via
 -- ffmpeg. Forces mjpeg output explicitly (-f) rather than relying on a
 -- .jpg extension, since os.tmpname() doesn't give us one.
+--
+-- Uses job.file.path, NOT job.file.url. Hovering a file inside yazi's
+-- search results gives a url like "search://mov$:4:4//real/path/x.mov" --
+-- a yazi-internal pseudo-URL, not something ffmpeg (or mpv, see peek()
+-- below) has any way to open. job.file.path is the resolved real path
+-- either way (confirmed identical to tostring(job.file.url) for a
+-- plain, non-search hover, so this doesn't change behavior outside
+-- search results) -- yazi-shared/src/url/lua.rs's "path" field is
+-- exactly this resolution (me.loc()), which is what ya.image_show does
+-- internally too (as_local()), just not something we were doing
+-- ourselves for the raw ffmpeg/mpv command lines.
 local function extract_thumbnail(job)
 	local tmp = os.tmpname()
 	local status = Command("ffmpeg")
@@ -240,7 +296,7 @@ local function extract_thumbnail(job)
 			"-ss",
 			"0",
 			"-i",
-			tostring(job.file.url),
+			tostring(job.file.path),
 			"-frames:v",
 			"1",
 			"-f",
@@ -270,6 +326,7 @@ end
 -- matches what mpv is about to show, at the cost of one fast ffmpeg call
 -- (~70ms) per hover -- acceptable given the 0.15s debounce already ahead
 -- of this in peek().
+--
 -- ya.preview_widget (yazi-plugin/src/utils/preview.rs) only accepts nil, a
 -- renderable (or table of them), or a proper mlua Error userdata -- never
 -- a plain Lua string. ya.image_show's own failure already returns a
@@ -302,7 +359,28 @@ yazi_pid="$PPID"
 
 	mpv "$@" 2>/dev/null &
 	mpid=$!
-	trap 'kill -9 "$mpid" 2>/dev/null; exit 0' TERM INT
+
+	# SIGTERM first, SIGKILL only as a fallback if it doesn't respond
+	# quickly. SIGKILL gives mpv no chance to clean up its own terminal
+	# state -- confirmed (~56ms typical) it exits promptly on SIGTERM, so
+	# there's little cost to preferring it. This mattered for more than
+	# the cursor-position issue already noted above: mpv negotiates a
+	# kitty keyboard-protocol mode with the terminal for precise key
+	# reporting, and SIGKILL was skipping whatever it does to release that
+	# on exit -- observed live as yazi's own keyboard input (specifically
+	# entering search) breaking after a video had been playing.
+	stop_mpv() {
+		kill -TERM "$mpid" 2>/dev/null
+		i=0
+		while [ "$i" -lt 6 ]; do
+			kill -0 "$mpid" 2>/dev/null || return 0
+			sleep 0.05
+			i=$((i + 1))
+		done
+		kill -9 "$mpid" 2>/dev/null
+	}
+
+	trap 'stop_mpv; exit 0' TERM INT
 
 	tmp="$YAZI_VIDEO_MARKER.$$"
 	echo "$$" > "$tmp" && mv -f "$tmp" "$YAZI_VIDEO_MARKER"
@@ -317,7 +395,7 @@ yazi_pid="$PPID"
 		[ -n "$current" ] && superseded_by_video=1
 		break
 	done
-	kill -9 "$mpid" 2>/dev/null
+	stop_mpv
 	if [ "$superseded_by_video" != "1" ]; then
 		printf '\033_Gq=2,a=d,d=A\033\\\033[H'
 	fi
@@ -326,7 +404,11 @@ disown 2>/dev/null
 ]]
 
 function M:peek(job)
-	local url = tostring(job.file.url)
+	-- job.file.path, not job.file.url -- see the note on extract_thumbnail
+	-- for why, and also just more correct here: two different search
+	-- queries wrapping the same underlying file should count as "the same
+	-- file already playing", which comparing the raw url wouldn't catch.
+	local url = tostring(job.file.path)
 	if not set_url(url) then
 		return ya.preview_widget(job, nil)
 	end
@@ -378,19 +460,6 @@ function M:peek(job)
 		"--osc=no",
 		"--osd-level=0",
 		"--really-quiet", -- silences status line + startup/info text alike
-		-- Speculative fix for an AVI-specific symptom ("No more keyframes
-		-- available", or playback stuck on the first frame) reported live
-		-- on real files that weren't available to reproduce against here
-		-- -- synthetic AVI test files (both a plain remux and a proper
-		-- Xvid encode) played and looped cleanly without it, so this
-		-- couldn't be directly verified to fix that specific case. Forces
-		-- ffmpeg/mpv to regenerate presentation timestamps rather than
-		-- trust the container's own, which is a well-known mitigation for
-		-- exactly this class of keyframe-index/seek problem on malformed
-		-- or looser-muxed containers (more common in AVI than newer
-		-- formats) -- and a no-op for files with valid timestamps already,
-		-- so safe to apply unconditionally rather than only for .avi.
-		"--demuxer-lavf-o=fflags=+genpts",
 		"--vo=kitty",
 		"--vo-kitty-alt-screen=no",
 		-- Don't let mpv clear the terminal on its own -- it clears far
@@ -403,7 +472,7 @@ function M:peek(job)
 		("--vo-kitty-left=%d"):format(area.x + 1), -- 1-indexed per mpv's docs
 		("--vo-kitty-top=%d"):format(area.y + 1),
 		("--video-aspect-override=%d:%d"):format(px_w, px_h), -- see alignment note up top
-		tostring(job.file.url),
+		tostring(job.file.path), -- not job.file.url -- see the note on extract_thumbnail
 	}
 
 	local child, spawn_err = Command("sh")
